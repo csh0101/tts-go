@@ -1,4 +1,4 @@
-package x
+package edge
 
 import (
 	"bytes"
@@ -104,9 +104,7 @@ func splitTextByByteLength(text string, byteLength int) [][]byte {
 }
 
 func mkssml(text string, voice string, rate string, volume string) string {
-	ssml := fmt.Sprintf(
-		"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"+
-			"<voice name='%s'><prosody pitch='+0Hz' rate='%s' volume='%s'>%s</prosody></voice></speak>",
+	ssml := fmt.Sprintf("<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='%s'><prosody pitch='+0Hz' rate='%s' volume='%s'>%s</prosody></voice></speak>",
 		voice, rate, volume, text)
 	return ssml
 }
@@ -119,11 +117,7 @@ func dateToString() string {
 }
 
 func ssmlHeadersPlusData(requestID string, timestamp string, ssml string) string {
-	headers := fmt.Sprintf(
-		"X-RequestId:%s\r\n"+
-			"Content-Type:application/ssml+xml\r\n"+
-			"X-Timestamp:%sZ\r\n"+
-			"Path:ssml\r\n\r\n",
+	headers := fmt.Sprintf("X-RequestId:%s\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:%sZ\r\nPath:ssml\r\n\r\n",
 		requestID, timestamp)
 	return headers + ssml
 }
@@ -134,10 +128,16 @@ func calcMaxMesgSize(voice string, rate string, volume string) int {
 	return websocketMaxSize - overheadPerMessage
 }
 
-func NewCommunicate(text string, voice string, rate string, volume string, proxy string) (*Communicate, error) {
+func NewCommunicate(text string, opts ...Option) (*Communicate, error) {
+	voiceLangRegion := ""
+	voice := GetVoiceByOption(opts)
+	rate := GetRateByOption(opts)
+	volume := GetVolumeByOption(opts)
+	proxy := GetProxyByOption(opts)
 	// Default values
 	if voice == "" {
-		voice = "Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)"
+		voice = "en-US, AriaNeural"
+		voiceLangRegion = "en-US, AriaNeural"
 	}
 	if rate == "" {
 		rate = "+0%"
@@ -148,8 +148,15 @@ func NewCommunicate(text string, voice string, rate string, volume string, proxy
 
 	// Validate voice
 	validVoicePattern := regexp.MustCompile(`^([a-z]{2,})-([A-Z]{2,})-(.+Neural)$`)
-	if !validVoicePattern.MatchString(voice) {
-		return nil, errors.New("Invalid voice")
+	if validVoicePattern.MatchString(voice) {
+		voiceLangRegion = voice
+		strs := strings.Split(voice, "-")
+		lang := strs[0]
+		region := strs[1]
+		name := strs[2]
+		voice = fmt.Sprintf("Microsoft Server Speech Text to Speech Voice (%s-%s, %s)", lang, region, name)
+	} else {
+		return nil, errors.New("invalid voice")
 	}
 
 	// Validate rate
@@ -165,11 +172,12 @@ func NewCommunicate(text string, voice string, rate string, volume string, proxy
 	}
 
 	return &Communicate{
-		Text:   text,
-		Voice:  voice,
-		Rate:   rate,
-		Volume: volume,
-		Proxy:  proxy,
+		Text:            text,
+		Voice:           voice,
+		VoiceLangRegion: voiceLangRegion,
+		Rate:            rate,
+		Volume:          volume,
+		Proxy:           proxy,
 	}, nil
 }
 
@@ -193,11 +201,13 @@ func dictReplace(data string, entities map[string]string) string {
 }
 
 type Communicate struct {
-	Text   string
-	Voice  string
-	Rate   string
-	Volume string
-	Proxy  string
+	Text            string
+	Voice           string
+	VoiceLangRegion string
+	Rate            string
+	Volume          string
+	Proxy           string
+	op              chan map[string]interface{}
 }
 
 type UnknownResponse struct {
@@ -216,6 +226,21 @@ type WebSocketError struct {
 	Message string
 }
 
+func (c *Communicate) CloseOutput() {
+	close(c.op)
+}
+
+func (c *Communicate) makeHeaders() http.Header {
+	headers := make(http.Header)
+	headers.Set("Pragma", "no-cache")
+	headers.Set("Cache-Control", "no-cache")
+	headers.Set("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+	headers.Set("Accept-Encoding", "gzip, deflate, br")
+	headers.Set("Accept-Language", "en-US,en;q=0.9")
+	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36 Edg/91.0.864.41")
+	return headers
+}
+
 func (c *Communicate) Stream() (<-chan map[string]interface{}, error) {
 	texts := splitTextByByteLength(
 		escape(removeIncompatibleCharacters(c.Text)),
@@ -229,17 +254,10 @@ func (c *Communicate) Stream() (<-chan map[string]interface{}, error) {
 	output := make(chan map[string]interface{})
 
 	for idx, text := range texts {
-		wsURL := WSS_URL + "&ConnectionId=" + connectID()
-		headers := make(http.Header)
-		headers.Set("Pragma", "no-cache")
-		headers.Set("Cache-Control", "no-cache")
-		headers.Set("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-		headers.Set("Accept-Encoding", "gzip, deflate, br")
-		headers.Set("Accept-Language", "en-US,en;q=0.9")
-		headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36 Edg/91.0.864.41")
-
+		fmt.Printf("text=%s\n", text)
+		wsURL := WssURL + "&ConnectionId=" + connectID()
 		dialer := websocket.Dialer{}
-		conn, _, err := dialer.Dial(wsURL, headers)
+		conn, _, err := dialer.Dial(wsURL, c.makeHeaders())
 		if err != nil {
 			return nil, err
 		}
@@ -319,16 +337,21 @@ func (c *Communicate) Stream() (<-chan map[string]interface{}, error) {
 							Metadata []struct {
 								Type string `json:"Type"`
 								Data struct {
-									Offset   int    `json:"Offset"`
-									Duration int    `json:"Duration"`
-									Text     string `json:"text"`
+									Offset   int `json:"Offset"`
+									Duration int `json:"Duration"`
+									Text     struct {
+										Text         string `json:"Text"`
+										Length       int64  `json:"Length"`
+										BoundaryType string `json:"BoundaryType"`
+									} `json:"text"`
 								} `json:"Data"`
 							} `json:"Metadata"`
 						}
 						err := json.Unmarshal([]byte(data), &metadata)
 						if err != nil {
+							msg := fmt.Sprintf("err=%s, data=%s", err.Error(), string(data))
 							output <- map[string]interface{}{
-								"error": UnknownResponse{Message: err.Error()},
+								"error": UnknownResponse{Message: msg},
 							}
 							break
 						}
@@ -389,6 +412,7 @@ func (c *Communicate) Stream() (<-chan map[string]interface{}, error) {
 						"type": "audio",
 						"data": audioData,
 					}
+					audioWasReceived = true
 				} else {
 					if message != nil {
 						output <- map[string]interface{}{
@@ -412,9 +436,10 @@ func (c *Communicate) Stream() (<-chan map[string]interface{}, error) {
 					"error": NoAudioReceived{Message: "No audio was received. Please verify that your parameters are correct."},
 				}
 			}
+			close(output)
 		}()
 	}
-
+	c.op = output
 	return output, nil
 }
 
